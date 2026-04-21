@@ -7,10 +7,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/metacubex/mihomo/log"
 )
 
 type ContextDialer interface {
@@ -49,10 +52,29 @@ type session struct {
 	readCh chan []byte
 	done   chan struct{}
 	once   sync.Once
+
+	errMu sync.RWMutex
+	err   error
 }
 
 func (s *session) closeDone() {
 	s.once.Do(func() { close(s.done) })
+}
+
+func (s *session) setErr(err error) {
+	s.errMu.Lock()
+	s.err = err
+	s.errMu.Unlock()
+}
+
+func (s *session) getErr() error {
+	s.errMu.RLock()
+	err := s.err
+	s.errMu.RUnlock()
+	if err == nil {
+		return io.EOF
+	}
+	return err
 }
 
 type openResult struct {
@@ -63,6 +85,7 @@ type openResult struct {
 type writeReq struct {
 	f   Frame
 	res chan error
+	recycle func()
 }
 
 type Client struct {
@@ -80,17 +103,25 @@ type Client struct {
 	nonceWin *NonceWindow
 
 	writeQ chan writeReq
+	ctrlQ  chan writeReq
 
 	reconnMu sync.Mutex
 
 	nextConnID atomic.Uint32
 
-	sessionsMu sync.Mutex
+	sessionsMu sync.RWMutex
 	sessions   map[uint32]*session
 
 	closed    chan struct{}
 	closeOnce sync.Once
+
+	connGen atomic.Uint64
 }
+
+const (
+	sessionReadQueueSize = 256
+	dataEnqueueTimeout   = 300 * time.Millisecond
+)
 
 func NewClient(opt Option) (*Client, error) {
 	conn, err := opt.dialTCP(opt.OpenTimeout)
@@ -111,11 +142,13 @@ func NewClient(opt Option) (*Client, error) {
 		nonceGen: newNonceGen(),
 		nonceWin: NewNonceWindow(),
 		writeQ:   make(chan writeReq, 2048),
+		ctrlQ:    make(chan writeReq, 512),
 		sessions: make(map[uint32]*session),
 		closed:   make(chan struct{}),
 	}
 	tc.connected.Store(true)
 	tc.nextConnID.Store(1)
+	tc.connGen.Store(1)
 
 	go tc.writerLoop()
 	go tc.readLoop(conn, tc.reader)
@@ -130,37 +163,63 @@ func (tc *Client) OpenStream(ctx context.Context, target string) (net.Conn, erro
 		return nil, err
 	}
 
+	gen := tc.connGen.Load()
 	id := tc.allocConnID()
-	s := &session{id: id, target: target, opened: make(chan openResult, 1), readCh: make(chan []byte, 128), done: make(chan struct{})}
+	s := &session{id: id, target: target, opened: make(chan openResult, 1), readCh: make(chan []byte, sessionReadQueueSize), done: make(chan struct{})}
 	tc.addSession(id, s)
+	log.Debugln("[CF] open start conn=%d target=%s", id, target)
 
 	if err := tc.writeFrame(Frame{Type: TypeOpen, ConnID: id, Nonce: tc.nonceGen.Next(), Payload: addrPayload}); err != nil {
-		tc.removeSession(id)
+		tc.removeSession(id, err)
 		return nil, err
 	}
 
-	timer := time.NewTimer(tc.opt.OpenTimeout)
+	openWait := tc.opt.OpenTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		remain := time.Until(dl)
+		if remain <= 0 {
+			tc.removeSession(id, context.DeadlineExceeded)
+			return nil, context.DeadlineExceeded
+		}
+		if openWait <= 0 || remain < openWait {
+			openWait = remain
+		}
+	}
+	if openWait <= 0 {
+		openWait = 20 * time.Second
+	}
+	timer := time.NewTimer(openWait)
 	defer timer.Stop()
 
 	select {
 	case r := <-s.opened:
+		if gen != tc.connGen.Load() {
+			err := errors.New("tunnel reconnected")
+			tc.removeSession(id, err)
+			return nil, err
+		}
 		if r.err != nil {
-			tc.removeSession(id)
+			tc.removeSession(id, r.err)
 			return nil, r.err
 		}
 		if r.rep != 0x00 {
-			tc.removeSession(id)
+			err := fmt.Errorf("remote open failed rep=%d", r.rep)
+			tc.removeSession(id, err)
 			return nil, fmt.Errorf("remote open failed rep=%d", r.rep)
 		}
+		log.Debugln("[CF] open ok conn=%d target=%s", id, target)
 		return newStreamConn(tc, s), nil
 	case <-timer.C:
-		tc.removeSession(id)
-		return nil, errors.New("open timeout")
+		err := errors.New("open timeout")
+		tc.removeSession(id, err)
+		return nil, err
 	case <-ctx.Done():
-		tc.removeSession(id)
+		tc.removeSession(id, ctx.Err())
 		return nil, ctx.Err()
+	case <-s.done:
+		return nil, s.getErr()
 	case <-tc.closed:
-		tc.removeSession(id)
+		tc.removeSession(id, errors.New("tunnel closed"))
 		return nil, errors.New("tunnel closed")
 	}
 }
@@ -174,6 +233,9 @@ func (tc *Client) allocConnID() uint32 {
 	for {
 		id := tc.nextConnID.Add(1)
 		if id != 0 {
+			if tc.getSession(id) != nil {
+				continue
+			}
 			return id
 		}
 	}
@@ -186,13 +248,13 @@ func (tc *Client) addSession(id uint32, s *session) {
 }
 
 func (tc *Client) getSession(id uint32) *session {
-	tc.sessionsMu.Lock()
+	tc.sessionsMu.RLock()
 	s := tc.sessions[id]
-	tc.sessionsMu.Unlock()
+	tc.sessionsMu.RUnlock()
 	return s
 }
 
-func (tc *Client) removeSession(id uint32) {
+func (tc *Client) removeSession(id uint32, err error) {
 	tc.sessionsMu.Lock()
 	s := tc.sessions[id]
 	if s != nil {
@@ -201,11 +263,12 @@ func (tc *Client) removeSession(id uint32) {
 	tc.sessionsMu.Unlock()
 	tc.nonceWin.Remove(id)
 	if s != nil {
+		s.setErr(err)
 		s.closeDone()
 	}
 }
 
-func (tc *Client) closeAllSessions() {
+func (tc *Client) closeAllSessions(err error) {
 	tc.sessionsMu.Lock()
 	ids := make([]uint32, 0, len(tc.sessions))
 	for id := range tc.sessions {
@@ -213,7 +276,7 @@ func (tc *Client) closeAllSessions() {
 	}
 	tc.sessionsMu.Unlock()
 	for _, id := range ids {
-		tc.removeSession(id)
+		tc.removeSession(id, err)
 	}
 }
 
@@ -230,23 +293,49 @@ func (tc *Client) closeWithErr(_ error) {
 		if c != nil {
 			_ = c.Close()
 		}
-		tc.closeAllSessions()
+		tc.closeAllSessions(errors.New("tunnel closed"))
 	})
 }
 
 func (tc *Client) writeFrame(f Frame) error {
-	req := writeReq{f: f, res: make(chan error, 1)}
+	return tc.writeFrameWithRecycle(f, nil)
+}
+
+func (tc *Client) writeFrameWithRecycle(f Frame, recycle func()) error {
+	req := writeReq{f: f, res: make(chan error, 1), recycle: recycle}
+	enqueueTimeout := tc.opt.WriteTimeout
+	if enqueueTimeout <= 0 {
+		enqueueTimeout = 5 * time.Second
+	}
+	if f.Type == TypeData && enqueueTimeout > 2*time.Second {
+		enqueueTimeout = 2 * time.Second
+	}
+	timer := time.NewTimer(enqueueTimeout)
+	defer timer.Stop()
 	select {
 	case <-tc.closed:
+		if recycle != nil {
+			recycle()
+		}
 		return errors.New("tunnel closed")
 	default:
 	}
+	q := tc.writeQ
+	if f.Type != TypeData {
+		q = tc.ctrlQ
+	}
 	select {
-	case tc.writeQ <- req:
+	case q <- req:
 	case <-tc.closed:
+		if recycle != nil {
+			recycle()
+		}
 		return errors.New("tunnel closed")
-	default:
-		return errors.New("writer queue full")
+	case <-timer.C:
+		if recycle != nil {
+			recycle()
+		}
+		return errors.New("writer queue timeout")
 	}
 	select {
 	case err := <-req.res:
@@ -256,46 +345,71 @@ func (tc *Client) writeFrame(f Frame) error {
 	}
 }
 
+func (tc *Client) handleWriteReq(req writeReq) {
+	defer func() {
+		if req.recycle != nil {
+			req.recycle()
+		}
+	}()
+	tc.connMu.RLock()
+	conn := tc.conn
+	writer := tc.writer
+	connected := tc.connected.Load()
+	tc.connMu.RUnlock()
+	if !connected || conn == nil || writer == nil {
+		req.res <- errors.New("tunnel unavailable")
+		return
+	}
+
+	b, err := marshalFrame(req.f, tc.secret)
+	if err == nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(tc.opt.WriteTimeout))
+		_, err = writer.Write(b)
+	}
+	if err == nil && req.f.Type != TypeData {
+		err = tc.flushWriter(conn, writer)
+	}
+	if err == nil && writer.Buffered() >= tc.opt.FlushBatch {
+		err = tc.flushWriter(conn, writer)
+	}
+	if err != nil {
+		go tc.handleDisconnect(conn, err)
+	}
+	req.res <- err
+}
+
+func (tc *Client) flushWriter(conn net.Conn, writer *bufio.Writer) error {
+	if writer == nil || writer.Buffered() == 0 {
+		return nil
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(tc.opt.WriteTimeout))
+	return writer.Flush()
+}
+
 func (tc *Client) writerLoop() {
 	ticker := time.NewTicker(tc.opt.FlushInterval)
 	defer ticker.Stop()
-	flush := func(conn net.Conn, writer *bufio.Writer) error {
-		if writer == nil || writer.Buffered() == 0 {
-			return nil
-		}
-		_ = conn.SetWriteDeadline(time.Now().Add(tc.opt.WriteTimeout))
-		return writer.Flush()
-	}
 	for {
 		select {
 		case <-tc.closed:
 			return
-		case req := <-tc.writeQ:
-			tc.connMu.RLock()
-			conn := tc.conn
-			writer := tc.writer
-			connected := tc.connected.Load()
-			tc.connMu.RUnlock()
-			if !connected || conn == nil || writer == nil {
-				req.res <- errors.New("tunnel unavailable")
-				continue
-			}
+		default:
+		}
 
-			b, err := marshalFrame(req.f, tc.secret)
-			if err == nil {
-				_ = conn.SetWriteDeadline(time.Now().Add(tc.opt.WriteTimeout))
-				_, err = writer.Write(b)
-			}
-			if err == nil && req.f.Type != TypeData {
-				err = flush(conn, writer)
-			}
-			if err == nil && writer.Buffered() >= tc.opt.FlushBatch {
-				err = flush(conn, writer)
-			}
-			if err != nil {
-				go tc.handleDisconnect(conn, err)
-			}
-			req.res <- err
+		select {
+		case req := <-tc.ctrlQ:
+			tc.handleWriteReq(req)
+			continue
+		default:
+		}
+
+		select {
+		case <-tc.closed:
+			return
+		case req := <-tc.ctrlQ:
+			tc.handleWriteReq(req)
+		case req := <-tc.writeQ:
+			tc.handleWriteReq(req)
 		case <-ticker.C:
 			tc.connMu.RLock()
 			conn := tc.conn
@@ -305,7 +419,7 @@ func (tc *Client) writerLoop() {
 			if !connected || conn == nil || writer == nil {
 				continue
 			}
-			if err := flush(conn, writer); err != nil {
+			if err := tc.flushWriter(conn, writer); err != nil {
 				go tc.handleDisconnect(conn, err)
 			}
 		}
@@ -356,16 +470,22 @@ func (tc *Client) dispatchFrame(f Frame) {
 		case s.opened <- openResult{rep: rep, err: fmt.Errorf("open error rep=%d", rep)}:
 		default:
 		}
-		tc.removeSession(f.ConnID)
+		tc.removeSession(f.ConnID, fmt.Errorf("open error rep=%d", rep))
 	case TypeData:
+		timer := time.NewTimer(dataEnqueueTimeout)
 		select {
 		case s.readCh <- f.Payload:
-		default:
-			tc.removeSession(f.ConnID)
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			log.Warnln("[CF] conn=%d read queue congested, closing stream", f.ConnID)
+			tc.removeSession(f.ConnID, errors.New("read queue congested"))
 			_ = tc.writeFrame(Frame{Type: TypeClose, ConnID: f.ConnID, Nonce: tc.nonceGen.Next()})
+			return
 		}
 	case TypeClose:
-		tc.removeSession(f.ConnID)
+		tc.removeSession(f.ConnID, io.EOF)
 	case TypePing:
 		_ = tc.writeFrame(Frame{Type: TypePong, ConnID: f.ConnID, Nonce: tc.nonceGen.Next()})
 	case TypePong:
@@ -388,6 +508,8 @@ func (tc *Client) handleDisconnect(deadConn net.Conn, _ error) {
 		return
 	}
 	tc.connected.Store(false)
+	tc.connGen.Add(1)
+	discErr := errors.New("tunnel disconnected")
 	c := tc.conn
 	tc.conn = nil
 	tc.reader = nil
@@ -397,7 +519,13 @@ func (tc *Client) handleDisconnect(deadConn net.Conn, _ error) {
 		_ = c.Close()
 	}
 
-	tc.closeAllSessions()
+	log.Warnln("[CF] tunnel disconnected")
+	tc.sessionsMu.Lock()
+	for _, s := range tc.sessions {
+		s.setErr(discErr)
+		s.closeDone()
+	}
+	tc.sessionsMu.Unlock()
 
 	backoff := tc.opt.ReconnectInitialBackoff
 	for {

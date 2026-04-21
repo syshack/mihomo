@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
@@ -12,8 +13,27 @@ import (
 
 type CF struct {
 	*Base
-	option *CFOption
-	client *cftransport.Client
+	option   *CFOption
+	client   *cftransport.Client
+	clientMu sync.Mutex
+	cfOpt    cftransport.Option
+}
+
+func (c *CF) getClient() (*cftransport.Client, error) {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+
+	if c.client != nil {
+		return c.client, nil
+	}
+
+	client, err := cftransport.NewClient(c.cfOpt)
+	if err != nil {
+		return nil, err
+	}
+
+	c.client = client
+	return c.client, nil
 }
 
 type CFOption struct {
@@ -25,6 +45,7 @@ type CFOption struct {
 	OpenTimeoutMs           int    `proxy:"open_timeout_ms,omitempty"`
 	IdleTimeoutMs           int    `proxy:"idle_timeout_ms,omitempty"`
 	WriteTimeoutMs          int    `proxy:"write_timeout_ms,omitempty"`
+	OpenDirect              bool   `proxy:"open_direct,omitempty"`
 	ReconnectInitialBackoff int    `proxy:"reconnect_initial_backoff_ms,omitempty"`
 	ReconnectMaxBackoff     int    `proxy:"reconnect_max_backoff_ms,omitempty"`
 	FlushIntervalMs         int    `proxy:"flush_interval_ms,omitempty"`
@@ -33,7 +54,12 @@ type CFOption struct {
 }
 
 func (c *CF) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	stream, err := c.client.OpenStream(ctx, metadata.RemoteAddress())
+	client, err := c.getClient()
+	if err != nil {
+		return nil, err
+	}
+
+	stream, err := client.OpenStream(ctx, metadata.RemoteAddress())
 	if err != nil {
 		return nil, err
 	}
@@ -51,8 +77,13 @@ func (c *CF) ProxyInfo() C.ProxyInfo {
 }
 
 func (c *CF) Close() error {
-	if c.client != nil {
-		return c.client.Close()
+	c.clientMu.Lock()
+	client := c.client
+	c.client = nil
+	c.clientMu.Unlock()
+
+	if client != nil {
+		return client.Close()
 	}
 	return nil
 }
@@ -75,8 +106,11 @@ func NewCF(option CFOption) (*CF, error) {
 		option: &option,
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
+	if option.OpenDirect {
+		outbound.dialer = nil
+	}
 
-	client, err := cftransport.NewClient(cftransport.Option{
+	outbound.cfOpt = cftransport.Option{
 		ServerAddr:              addr,
 		Secret:                  option.Secret,
 		Dialer:                  outbound.dialer,
@@ -88,11 +122,8 @@ func NewCF(option CFOption) (*CF, error) {
 		FlushInterval:           msOrDefault(option.FlushIntervalMs, 3*time.Millisecond),
 		ReadBufSize:             intOrDefault(option.ReadBufSize, 64*1024),
 		FlushBatch:              intOrDefault(option.FlushBatchBytes, 64*1024),
-	})
-	if err != nil {
-		return nil, err
 	}
-	outbound.client = client
+
 	return outbound, nil
 }
 

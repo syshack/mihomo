@@ -44,7 +44,7 @@ func (c *streamConn) Read(p []byte) (int, error) {
 		}
 		return n, nil
 	case <-c.s.done:
-		return 0, io.EOF
+		return 0, c.s.getErr()
 	case <-c.tc.closed:
 		return 0, io.EOF
 	}
@@ -76,7 +76,7 @@ func (c *streamConn) Close() error {
 	c.mu.Unlock()
 
 	_ = c.tc.writeFrame(Frame{Type: TypeClose, ConnID: c.s.id, Nonce: c.tc.nonceGen.Next()})
-	c.tc.removeSession(c.s.id)
+	c.tc.removeSession(c.s.id, net.ErrClosed)
 	return nil
 }
 
