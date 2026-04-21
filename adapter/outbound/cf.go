@@ -79,6 +79,7 @@ func NewCF(option CFOption) (*CF, error) {
 	client, err := cftransport.NewClient(cftransport.Option{
 		ServerAddr:              addr,
 		Secret:                  option.Secret,
+		Dialer:                  outbound.dialer,
 		OpenTimeout:             msOrDefault(option.OpenTimeoutMs, 20*time.Second),
 		IdleTimeout:             msOrDefault(option.IdleTimeoutMs, 300*time.Second),
 		WriteTimeout:            msOrDefault(option.WriteTimeoutMs, 15*time.Second),

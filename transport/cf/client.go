@@ -13,9 +13,14 @@ import (
 	"time"
 )
 
+type ContextDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
 type Option struct {
 	ServerAddr string
 	Secret     string
+	Dialer     ContextDialer
 
 	OpenTimeout             time.Duration
 	IdleTimeout             time.Duration
@@ -25,6 +30,15 @@ type Option struct {
 	FlushInterval           time.Duration
 	ReadBufSize             int
 	FlushBatch              int
+}
+
+func (o Option) dialTCP(timeout time.Duration) (net.Conn, error) {
+	if o.Dialer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		return o.Dialer.DialContext(ctx, "tcp", o.ServerAddr)
+	}
+	return net.DialTimeout("tcp", o.ServerAddr, timeout)
 }
 
 type session struct {
@@ -79,7 +93,7 @@ type Client struct {
 }
 
 func NewClient(opt Option) (*Client, error) {
-	conn, err := net.DialTimeout("tcp", opt.ServerAddr, opt.OpenTimeout)
+	conn, err := opt.dialTCP(opt.OpenTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -393,7 +407,7 @@ func (tc *Client) handleDisconnect(deadConn net.Conn, _ error) {
 		default:
 		}
 
-		conn, err := net.DialTimeout("tcp", tc.opt.ServerAddr, tc.opt.OpenTimeout)
+		conn, err := tc.opt.dialTCP(tc.opt.OpenTimeout)
 		if err == nil {
 			if err = writeClientHello(conn, tc.secret); err == nil {
 				reader := bufio.NewReader(conn)
