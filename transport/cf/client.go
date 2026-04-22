@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -302,6 +303,10 @@ func (tc *Client) writeFrame(f Frame) error {
 }
 
 func (tc *Client) writeFrameWithRecycle(f Frame, recycle func()) error {
+	return tc.writeFrameWithTimeout(f, recycle, 0)
+}
+
+func (tc *Client) writeFrameWithTimeout(f Frame, recycle func(), timeout time.Duration) error {
 	req := writeReq{f: f, res: make(chan error, 1), recycle: recycle}
 	enqueueTimeout := tc.opt.WriteTimeout
 	if enqueueTimeout <= 0 {
@@ -309,6 +314,9 @@ func (tc *Client) writeFrameWithRecycle(f Frame, recycle func()) error {
 	}
 	if f.Type == TypeData && enqueueTimeout > 2*time.Second {
 		enqueueTimeout = 2 * time.Second
+	}
+	if timeout > 0 && timeout < enqueueTimeout {
+		enqueueTimeout = timeout
 	}
 	timer := time.NewTimer(enqueueTimeout)
 	defer timer.Stop()
@@ -335,6 +343,9 @@ func (tc *Client) writeFrameWithRecycle(f Frame, recycle func()) error {
 		if recycle != nil {
 			recycle()
 		}
+		if timeout > 0 {
+			return os.ErrDeadlineExceeded
+		}
 		return errors.New("writer queue timeout")
 	}
 	select {
@@ -342,6 +353,11 @@ func (tc *Client) writeFrameWithRecycle(f Frame, recycle func()) error {
 		return err
 	case <-tc.closed:
 		return errors.New("tunnel closed")
+	case <-timer.C:
+		if timeout > 0 {
+			return os.ErrDeadlineExceeded
+		}
+		return errors.New("write timeout")
 	}
 }
 
