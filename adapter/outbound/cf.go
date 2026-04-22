@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
 	cftransport "github.com/metacubex/mihomo/transport/cf"
 )
@@ -67,7 +68,18 @@ func (c *CF) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, e
 }
 
 func (c *CF) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	return nil, C.ErrNotSupport
+	if err := c.ResolveUDP(ctx, metadata); err != nil {
+		return nil, err
+	}
+
+	client, err := c.getClient()
+	if err != nil {
+		return nil, err
+	}
+
+	pc := newCFMuxPacketConn(client)
+
+	return newPacketConn(N.NewThreadSafePacketConn(pc), c), nil
 }
 
 func (c *CF) ProxyInfo() C.ProxyInfo {
@@ -96,7 +108,7 @@ func NewCF(option CFOption) (*CF, error) {
 			Addr:         addr,
 			Type:         C.CF,
 			ProviderName: option.ProviderName,
-			UDP:          false,
+			UDP:          true,
 			TFO:          option.TFO,
 			MPTCP:        option.MPTCP,
 			Interface:    option.Interface,

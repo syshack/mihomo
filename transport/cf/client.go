@@ -78,6 +78,43 @@ func (s *session) getErr() error {
 	return err
 }
 
+type udpPacket struct {
+	b []byte
+}
+
+type udpSession struct {
+	id     uint32
+	target string
+
+	opened chan openResult
+	readCh chan udpPacket
+	done   chan struct{}
+	once   sync.Once
+
+	errMu sync.RWMutex
+	err   error
+}
+
+func (s *udpSession) closeDone() {
+	s.once.Do(func() { close(s.done) })
+}
+
+func (s *udpSession) setErr(err error) {
+	s.errMu.Lock()
+	s.err = err
+	s.errMu.Unlock()
+}
+
+func (s *udpSession) getErr() error {
+	s.errMu.RLock()
+	err := s.err
+	s.errMu.RUnlock()
+	if err == nil {
+		return io.EOF
+	}
+	return err
+}
+
 type openResult struct {
 	rep byte
 	err error
@@ -112,6 +149,7 @@ type Client struct {
 
 	sessionsMu sync.RWMutex
 	sessions   map[uint32]*session
+	udpSession map[uint32]*udpSession
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -122,6 +160,7 @@ type Client struct {
 const (
 	sessionReadQueueSize = 256
 	dataEnqueueTimeout   = 300 * time.Millisecond
+	udpEnqueueTimeout    = 300 * time.Millisecond
 )
 
 func NewClient(opt Option) (*Client, error) {
@@ -145,6 +184,7 @@ func NewClient(opt Option) (*Client, error) {
 		writeQ:   make(chan writeReq, 2048),
 		ctrlQ:    make(chan writeReq, 512),
 		sessions: make(map[uint32]*session),
+		udpSession: make(map[uint32]*udpSession),
 		closed:   make(chan struct{}),
 	}
 	tc.connected.Store(true)
@@ -225,6 +265,73 @@ func (tc *Client) OpenStream(ctx context.Context, target string) (net.Conn, erro
 	}
 }
 
+func (tc *Client) OpenPacket(ctx context.Context, target string) (net.PacketConn, error) {
+	addrPayload, err := EncodeAddress(target)
+	if err != nil {
+		return nil, err
+	}
+
+	gen := tc.connGen.Load()
+	id := tc.allocConnID()
+	s := &udpSession{id: id, target: target, opened: make(chan openResult, 1), readCh: make(chan udpPacket, sessionReadQueueSize), done: make(chan struct{})}
+	tc.addUDPSession(id, s)
+	log.Debugln("[CF] udp open start conn=%d target=%s", id, target)
+
+	if err := tc.writeFrame(Frame{Type: TypeUDPOpen, ConnID: id, Nonce: tc.nonceGen.Next(), Payload: addrPayload}); err != nil {
+		tc.removeUDPSession(id, err)
+		return nil, err
+	}
+
+	openWait := tc.opt.OpenTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		remain := time.Until(dl)
+		if remain <= 0 {
+			tc.removeUDPSession(id, context.DeadlineExceeded)
+			return nil, context.DeadlineExceeded
+		}
+		if openWait <= 0 || remain < openWait {
+			openWait = remain
+		}
+	}
+	if openWait <= 0 {
+		openWait = 20 * time.Second
+	}
+	timer := time.NewTimer(openWait)
+	defer timer.Stop()
+
+	select {
+	case r := <-s.opened:
+		if gen != tc.connGen.Load() {
+			err := errors.New("tunnel reconnected")
+			tc.removeUDPSession(id, err)
+			return nil, err
+		}
+		if r.err != nil {
+			tc.removeUDPSession(id, r.err)
+			return nil, r.err
+		}
+		if r.rep != 0x00 {
+			err := fmt.Errorf("remote udp open failed rep=%d", r.rep)
+			tc.removeUDPSession(id, err)
+			return nil, err
+		}
+		log.Debugln("[CF] udp open ok conn=%d target=%s", id, target)
+		return newPacketConnCF(tc, s), nil
+	case <-timer.C:
+		err := errors.New("udp open timeout")
+		tc.removeUDPSession(id, err)
+		return nil, err
+	case <-ctx.Done():
+		tc.removeUDPSession(id, ctx.Err())
+		return nil, ctx.Err()
+	case <-s.done:
+		return nil, s.getErr()
+	case <-tc.closed:
+		tc.removeUDPSession(id, errors.New("tunnel closed"))
+		return nil, errors.New("tunnel closed")
+	}
+}
+
 func (tc *Client) Close() error {
 	tc.closeWithErr(nil)
 	return nil
@@ -234,7 +341,7 @@ func (tc *Client) allocConnID() uint32 {
 	for {
 		id := tc.nextConnID.Add(1)
 		if id != 0 {
-			if tc.getSession(id) != nil {
+			if tc.getSession(id) != nil || tc.getUDPSession(id) != nil {
 				continue
 			}
 			return id
@@ -255,6 +362,19 @@ func (tc *Client) getSession(id uint32) *session {
 	return s
 }
 
+func (tc *Client) addUDPSession(id uint32, s *udpSession) {
+	tc.sessionsMu.Lock()
+	tc.udpSession[id] = s
+	tc.sessionsMu.Unlock()
+}
+
+func (tc *Client) getUDPSession(id uint32) *udpSession {
+	tc.sessionsMu.RLock()
+	s := tc.udpSession[id]
+	tc.sessionsMu.RUnlock()
+	return s
+}
+
 func (tc *Client) removeSession(id uint32, err error) {
 	tc.sessionsMu.Lock()
 	s := tc.sessions[id]
@@ -269,15 +389,33 @@ func (tc *Client) removeSession(id uint32, err error) {
 	}
 }
 
+func (tc *Client) removeUDPSession(id uint32, err error) {
+	tc.sessionsMu.Lock()
+	s := tc.udpSession[id]
+	if s != nil {
+		delete(tc.udpSession, id)
+	}
+	tc.sessionsMu.Unlock()
+	tc.nonceWin.Remove(id)
+	if s != nil {
+		s.setErr(err)
+		s.closeDone()
+	}
+}
+
 func (tc *Client) closeAllSessions(err error) {
 	tc.sessionsMu.Lock()
-	ids := make([]uint32, 0, len(tc.sessions))
+	ids := make([]uint32, 0, len(tc.sessions)+len(tc.udpSession))
 	for id := range tc.sessions {
+		ids = append(ids, id)
+	}
+	for id := range tc.udpSession {
 		ids = append(ids, id)
 	}
 	tc.sessionsMu.Unlock()
 	for _, id := range ids {
 		tc.removeSession(id, err)
+		tc.removeUDPSession(id, err)
 	}
 }
 
@@ -459,7 +597,8 @@ func (tc *Client) readLoop(conn net.Conn, reader *bufio.Reader) {
 
 func (tc *Client) dispatchFrame(f Frame) {
 	s := tc.getSession(f.ConnID)
-	if s == nil {
+	us := tc.getUDPSession(f.ConnID)
+	if s == nil && us == nil {
 		if f.Type == TypePing {
 			_ = tc.writeFrame(Frame{Type: TypePong, ConnID: f.ConnID, Nonce: tc.nonceGen.Next()})
 			return
@@ -473,21 +612,39 @@ func (tc *Client) dispatchFrame(f Frame) {
 
 	switch f.Type {
 	case TypeOpenOK:
-		select {
-		case s.opened <- openResult{rep: 0x00}:
-		default:
+		if s != nil {
+			select {
+			case s.opened <- openResult{rep: 0x00}:
+			default:
+			}
+		} else if us != nil {
+			select {
+			case us.opened <- openResult{rep: 0x00}:
+			default:
+			}
 		}
 	case TypeOpenErr:
 		rep := byte(0x01)
 		if len(f.Payload) > 0 {
 			rep = f.Payload[0]
 		}
-		select {
-		case s.opened <- openResult{rep: rep, err: fmt.Errorf("open error rep=%d", rep)}:
-		default:
+		if s != nil {
+			select {
+			case s.opened <- openResult{rep: rep, err: fmt.Errorf("open error rep=%d", rep)}:
+			default:
+			}
+			tc.removeSession(f.ConnID, fmt.Errorf("open error rep=%d", rep))
+		} else if us != nil {
+			select {
+			case us.opened <- openResult{rep: rep, err: fmt.Errorf("udp open error rep=%d", rep)}:
+			default:
+			}
+			tc.removeUDPSession(f.ConnID, fmt.Errorf("udp open error rep=%d", rep))
 		}
-		tc.removeSession(f.ConnID, fmt.Errorf("open error rep=%d", rep))
 	case TypeData:
+		if s == nil {
+			return
+		}
 		timer := time.NewTimer(dataEnqueueTimeout)
 		select {
 		case s.readCh <- f.Payload:
@@ -500,8 +657,25 @@ func (tc *Client) dispatchFrame(f Frame) {
 			_ = tc.writeFrame(Frame{Type: TypeClose, ConnID: f.ConnID, Nonce: tc.nonceGen.Next()})
 			return
 		}
+	case TypeUDPData:
+		if us == nil {
+			return
+		}
+		timer := time.NewTimer(udpEnqueueTimeout)
+		select {
+		case us.readCh <- udpPacket{b: f.Payload}:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			log.Warnln("[CF] udp conn=%d read queue congested, closing stream", f.ConnID)
+			tc.removeUDPSession(f.ConnID, errors.New("udp read queue congested"))
+			_ = tc.writeFrame(Frame{Type: TypeClose, ConnID: f.ConnID, Nonce: tc.nonceGen.Next()})
+			return
+		}
 	case TypeClose:
 		tc.removeSession(f.ConnID, io.EOF)
+		tc.removeUDPSession(f.ConnID, io.EOF)
 	case TypePing:
 		_ = tc.writeFrame(Frame{Type: TypePong, ConnID: f.ConnID, Nonce: tc.nonceGen.Next()})
 	case TypePong:
@@ -540,6 +714,10 @@ func (tc *Client) handleDisconnect(deadConn net.Conn, _ error) {
 	for _, s := range tc.sessions {
 		s.setErr(discErr)
 		s.closeDone()
+	}
+	for _, us := range tc.udpSession {
+		us.setErr(discErr)
+		us.closeDone()
 	}
 	tc.sessionsMu.Unlock()
 
