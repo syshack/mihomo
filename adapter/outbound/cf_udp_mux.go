@@ -28,8 +28,32 @@ type cfMuxPacketConn struct {
 
 type cfMuxPacket struct {
 	b    []byte
+	n    int
 	addr net.Addr
 	err  error
+	put  func()
+}
+
+const cfMuxPacketBufSize = 64 * 1024
+
+var cfMuxPacketPool = sync.Pool{
+	New: func() any {
+		return make([]byte, cfMuxPacketBufSize)
+	},
+}
+
+func getCFMuxPacketBuf() []byte {
+	return cfMuxPacketPool.Get().([]byte)
+}
+
+func putCFMuxPacketBuf(b []byte) {
+	if b == nil {
+		return
+	}
+	if cap(b) < cfMuxPacketBufSize {
+		return
+	}
+	cfMuxPacketPool.Put(b[:cfMuxPacketBufSize])
 }
 
 func newCFMuxPacketConn(client *cftransport.Client) net.PacketConn {
@@ -62,10 +86,13 @@ func (c *cfMuxPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	case <-timeout:
 		return 0, nil, os.ErrDeadlineExceeded
 	case pkt := <-c.readQ:
+		if pkt.put != nil {
+			defer pkt.put()
+		}
 		if pkt.err != nil {
 			return 0, nil, pkt.err
 		}
-		n := copy(p, pkt.b)
+		n := copy(p, pkt.b[:pkt.n])
 		return n, pkt.addr, nil
 	}
 }
@@ -98,6 +125,17 @@ func (c *cfMuxPacketConn) Close() error {
 			delete(c.conns, key)
 		}
 		c.mu.Unlock()
+
+		for {
+			select {
+			case pkt := <-c.readQ:
+				if pkt.put != nil {
+					pkt.put()
+				}
+			default:
+				return
+			}
+		}
 	})
 
 	return nil
@@ -190,14 +228,15 @@ func (c *cfMuxPacketConn) getOrCreateConn(addr net.Addr, deadline time.Time) (ne
 }
 
 func (c *cfMuxPacketConn) readLoop(key string, pc net.PacketConn) {
-	buf := make([]byte, 64*1024)
-
 	for {
+		buf := getCFMuxPacketBuf()
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
+			putCFMuxPacketBuf(buf)
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				select {
 				case c.readQ <- cfMuxPacket{err: err}:
+				default:
 				case <-c.closed:
 				}
 			}
@@ -209,12 +248,17 @@ func (c *cfMuxPacketConn) readLoop(key string, pc net.PacketConn) {
 			return
 		}
 
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-
 		select {
-		case c.readQ <- cfMuxPacket{b: pkt, addr: addr}:
+		case c.readQ <- cfMuxPacket{
+			b:    buf,
+			n:    n,
+			addr: addr,
+			put: func() {
+				putCFMuxPacketBuf(buf)
+			},
+		}:
 		case <-c.closed:
+			putCFMuxPacketBuf(buf)
 			return
 		}
 	}

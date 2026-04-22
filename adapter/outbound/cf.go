@@ -88,6 +88,10 @@ func (c *CF) ProxyInfo() C.ProxyInfo {
 	return info
 }
 
+func (c *CF) SupportUOT() bool {
+	return true
+}
+
 func (c *CF) Close() error {
 	c.clientMu.Lock()
 	client := c.client
