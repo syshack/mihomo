@@ -51,12 +51,22 @@ type Option struct {
 }
 
 func (o Option) dialTCP(timeout time.Duration) (net.Conn, error) {
+	var conn net.Conn
+	var err error
 	if o.Dialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		return o.Dialer.DialContext(ctx, "tcp", o.ServerAddr)
+		conn, err = o.Dialer.DialContext(ctx, "tcp", o.ServerAddr)
+	} else {
+		conn, err = net.DialTimeout("tcp", o.ServerAddr, timeout)
 	}
-	return net.DialTimeout("tcp", o.ServerAddr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+	return conn, nil
 }
 
 type session struct {
@@ -596,7 +606,7 @@ func (tc *Client) handleWriteReqWithScratch(req writeReq, scratch []byte) []byte
 		_ = conn.SetWriteDeadline(time.Now().Add(tc.opt.WriteTimeout))
 		_, err = writer.Write(b)
 	}
-	if err == nil && req.f.Type != TypeData {
+	if err == nil && (req.f.Type != TypeData || len(b) < 1460) {
 		err = tc.flushWriter(conn, writer)
 	}
 	if err == nil && writer.Buffered() >= tc.opt.FlushBatch {
