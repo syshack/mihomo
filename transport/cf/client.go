@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,19 @@ type Option struct {
 	FlushInterval           time.Duration
 	ReadBufSize             int
 	FlushBatch              int
+	TunnelCount             int
+
+	ObfsNegotiate       bool
+	ObfsStrictNegotiate bool
+	ObfsFallbackMode    string
+	ObfsPadMin          int
+	ObfsPadMax          int
+	ObfsRotateMin       int
+	ObfsRotateMax       int
+	ObfsDynamicRotate   bool
+	ObfsRotateSpan      int
+	ObfsJitterMinMs     int
+	ObfsJitterMaxMs     int
 }
 
 func (o Option) dialTCP(timeout time.Duration) (net.Conn, error) {
@@ -121,8 +135,8 @@ type openResult struct {
 }
 
 type writeReq struct {
-	f   Frame
-	res chan error
+	f       Frame
+	res     chan error
 	recycle func()
 }
 
@@ -130,6 +144,8 @@ type Client struct {
 	opt Option
 
 	secret []byte
+	obfs   ObfsParams
+	hello  HelloOptions
 
 	conn      net.Conn
 	reader    *bufio.Reader
@@ -164,28 +180,70 @@ const (
 )
 
 func NewClient(opt Option) (*Client, error) {
+	initialObfs := ObfsParams{
+		PadMin:        uint8(opt.ObfsPadMin),
+		PadMax:        uint8(opt.ObfsPadMax),
+		RotateMin:     uint8(opt.ObfsRotateMin),
+		RotateMax:     uint8(opt.ObfsRotateMax),
+		DynamicRotate: opt.ObfsDynamicRotate,
+		RotateSpan:    uint8(opt.ObfsRotateSpan),
+		JitterMinMs:   uint8(opt.ObfsJitterMinMs),
+		JitterMaxMs:   uint8(opt.ObfsJitterMaxMs),
+	}
+	if !opt.ObfsNegotiate && opt.ObfsPadMax == 0 && opt.ObfsRotateMin == 0 && opt.ObfsRotateMax == 0 && opt.ObfsRotateSpan == 0 {
+		initialObfs = defaultObfsParams()
+	}
+	normalizedObfs, err := initialObfs.Normalize()
+	if err != nil {
+		return nil, err
+	}
+
 	conn, err := opt.dialTCP(opt.OpenTimeout)
 	if err != nil {
 		return nil, err
 	}
-	if err := writeClientHello(conn, []byte(opt.Secret)); err != nil {
-		_ = conn.Close()
-		return nil, err
+	helloOpts := HelloOptions{Negotiate: opt.ObfsNegotiate, Params: normalizedObfs}
+	negotiatedObfs, err := writeClientHelloWithOptions(conn, []byte(opt.Secret), helloOpts)
+	if err != nil {
+		if helloOpts.Negotiate {
+			if opt.ObfsStrictNegotiate || strings.EqualFold(opt.ObfsFallbackMode, "fail") {
+				_ = conn.Close()
+				return nil, err
+			}
+			log.Warnln("[CF] obfs negotiate failed, fallback to legacy hello: %v", err)
+			_ = conn.Close()
+			conn, err = opt.dialTCP(opt.OpenTimeout)
+			if err != nil {
+				return nil, err
+			}
+			if err = writeClientHello(conn, []byte(opt.Secret)); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			negotiatedObfs = defaultObfsParams()
+		} else {
+			_ = conn.Close()
+			return nil, err
+		}
+	} else if helloOpts.Negotiate {
+		log.Debugln("[CF] obfs negotiated pad=%d rotate=%d-%d dynamic=%t span=%d", negotiatedObfs.PadMax, negotiatedObfs.RotateMin, negotiatedObfs.RotateMax, negotiatedObfs.DynamicRotate, negotiatedObfs.RotateSpan)
 	}
 
 	tc := &Client{
-		opt:      opt,
-		secret:   []byte(opt.Secret),
-		conn:     conn,
-		reader:   bufio.NewReader(conn),
-		writer:   bufio.NewWriterSize(conn, 64*1024),
-		nonceGen: newNonceGen(),
-		nonceWin: NewNonceWindow(),
-		writeQ:   make(chan writeReq, 2048),
-		ctrlQ:    make(chan writeReq, 512),
-		sessions: make(map[uint32]*session),
+		opt:        opt,
+		secret:     []byte(opt.Secret),
+		obfs:       negotiatedObfs,
+		hello:      helloOpts,
+		conn:       conn,
+		reader:     bufio.NewReader(conn),
+		writer:     bufio.NewWriterSize(conn, 64*1024),
+		nonceGen:   newNonceGen(),
+		nonceWin:   NewNonceWindow(),
+		writeQ:     make(chan writeReq, 2048),
+		ctrlQ:      make(chan writeReq, 512),
+		sessions:   make(map[uint32]*session),
 		udpSession: make(map[uint32]*udpSession),
-		closed:   make(chan struct{}),
+		closed:     make(chan struct{}),
 	}
 	tc.connected.Store(true)
 	tc.nextConnID.Store(1)
@@ -362,6 +420,13 @@ func (tc *Client) getSession(id uint32) *session {
 	return s
 }
 
+func (tc *Client) getObfsParams() ObfsParams {
+	tc.connMu.RLock()
+	p := tc.obfs
+	tc.connMu.RUnlock()
+	return p
+}
+
 func (tc *Client) addUDPSession(id uint32, s *udpSession) {
 	tc.sessionsMu.Lock()
 	tc.udpSession[id] = s
@@ -500,6 +565,10 @@ func (tc *Client) writeFrameWithTimeout(f Frame, recycle func(), timeout time.Du
 }
 
 func (tc *Client) handleWriteReq(req writeReq) {
+	tc.handleWriteReqWithScratch(req, nil)
+}
+
+func (tc *Client) handleWriteReqWithScratch(req writeReq, scratch []byte) []byte {
 	defer func() {
 		if req.recycle != nil {
 			req.recycle()
@@ -512,11 +581,18 @@ func (tc *Client) handleWriteReq(req writeReq) {
 	tc.connMu.RUnlock()
 	if !connected || conn == nil || writer == nil {
 		req.res <- errors.New("tunnel unavailable")
-		return
+		return scratch
+	}
+	if req.f.Type == TypeData || req.f.Type == TypeUDPData {
+		if d, ok := randomJitter(tc.getObfsParams()); ok {
+			time.Sleep(d)
+		}
 	}
 
-	b, err := marshalFrame(req.f, tc.secret)
+	scratch = scratch[:0]
+	b, err := appendFrameWithParams(scratch, req.f, tc.secret, tc.getObfsParams())
 	if err == nil {
+		scratch = b
 		_ = conn.SetWriteDeadline(time.Now().Add(tc.opt.WriteTimeout))
 		_, err = writer.Write(b)
 	}
@@ -530,6 +606,7 @@ func (tc *Client) handleWriteReq(req writeReq) {
 		go tc.handleDisconnect(conn, err)
 	}
 	req.res <- err
+	return scratch
 }
 
 func (tc *Client) flushWriter(conn net.Conn, writer *bufio.Writer) error {
@@ -543,6 +620,7 @@ func (tc *Client) flushWriter(conn net.Conn, writer *bufio.Writer) error {
 func (tc *Client) writerLoop() {
 	ticker := time.NewTicker(tc.opt.FlushInterval)
 	defer ticker.Stop()
+	scratch := make([]byte, 0, 64*1024)
 	for {
 		select {
 		case <-tc.closed:
@@ -552,7 +630,7 @@ func (tc *Client) writerLoop() {
 
 		select {
 		case req := <-tc.ctrlQ:
-			tc.handleWriteReq(req)
+			scratch = tc.handleWriteReqWithScratch(req, scratch)
 			continue
 		default:
 		}
@@ -561,9 +639,9 @@ func (tc *Client) writerLoop() {
 		case <-tc.closed:
 			return
 		case req := <-tc.ctrlQ:
-			tc.handleWriteReq(req)
+			scratch = tc.handleWriteReqWithScratch(req, scratch)
 		case req := <-tc.writeQ:
-			tc.handleWriteReq(req)
+			scratch = tc.handleWriteReqWithScratch(req, scratch)
 		case <-ticker.C:
 			tc.connMu.RLock()
 			conn := tc.conn
@@ -583,7 +661,7 @@ func (tc *Client) writerLoop() {
 func (tc *Client) readLoop(conn net.Conn, reader *bufio.Reader) {
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(tc.opt.IdleTimeout))
-		f, err := readFrame(reader, tc.secret)
+		f, err := readFrameWithParams(reader, tc.secret, tc.getObfsParams())
 		if err != nil {
 			tc.handleDisconnect(conn, err)
 			return
@@ -731,13 +809,30 @@ func (tc *Client) handleDisconnect(deadConn net.Conn, _ error) {
 
 		conn, err := tc.opt.dialTCP(tc.opt.OpenTimeout)
 		if err == nil {
-			if err = writeClientHello(conn, tc.secret); err == nil {
+			var negotiatedObfs ObfsParams
+			negotiatedObfs, err = writeClientHelloWithOptions(conn, tc.secret, tc.hello)
+			if err != nil && tc.hello.Negotiate {
+				if tc.opt.ObfsStrictNegotiate || strings.EqualFold(tc.opt.ObfsFallbackMode, "fail") {
+					_ = conn.Close()
+				} else {
+					_ = conn.Close()
+					conn, err = tc.opt.dialTCP(tc.opt.OpenTimeout)
+					if err == nil {
+						err = writeClientHello(conn, tc.secret)
+						if err == nil {
+							negotiatedObfs = defaultObfsParams()
+						}
+					}
+				}
+			}
+			if err == nil {
 				reader := bufio.NewReader(conn)
 				writer := bufio.NewWriterSize(conn, 64*1024)
 				tc.connMu.Lock()
 				tc.conn = conn
 				tc.reader = reader
 				tc.writer = writer
+				tc.obfs = negotiatedObfs
 				tc.connected.Store(true)
 				tc.connMu.Unlock()
 				go tc.readLoop(conn, reader)
@@ -815,4 +910,19 @@ func jitterDuration(base time.Duration) time.Duration {
 	rangeSize := int64(2*delta + 1)
 	offset := time.Duration(int64(binary.BigEndian.Uint16(b[:]))%rangeSize) - delta
 	return base + offset
+}
+
+func randomJitter(p ObfsParams) (time.Duration, bool) {
+	if p.JitterMaxMs == 0 || p.JitterMinMs > p.JitterMaxMs {
+		return 0, false
+	}
+	if p.JitterMinMs == p.JitterMaxMs {
+		return time.Duration(p.JitterMinMs) * time.Millisecond, true
+	}
+	span := int(p.JitterMaxMs-p.JitterMinMs) + 1
+	v, err := randByte(span)
+	if err != nil {
+		return time.Duration(p.JitterMinMs) * time.Millisecond, true
+	}
+	return time.Duration(int(p.JitterMinMs)+int(v)) * time.Millisecond, true
 }

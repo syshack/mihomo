@@ -28,20 +28,34 @@ type Frame struct {
 }
 
 func marshalFrame(f Frame, secret []byte) ([]byte, error) {
-	enc, err := encodePayload(f.Payload, secret, f.Nonce)
+	return marshalFrameWithParams(f, secret, defaultObfsParams())
+}
+
+func marshalFrameWithParams(f Frame, secret []byte, params ObfsParams) ([]byte, error) {
+	return appendFrameWithParams(nil, f, secret, params)
+}
+
+func appendFrameWithParams(dst []byte, f Frame, secret []byte, params ObfsParams) ([]byte, error) {
+	start := len(dst)
+	dst = append(dst, make([]byte, HeaderLen)...)
+	dst[start] = f.Type
+	binary.BigEndian.PutUint32(dst[start+1:start+5], f.ConnID)
+	binary.BigEndian.PutUint32(dst[start+9:start+13], f.Nonce)
+
+	payloadStart := len(dst)
+	dst, err := appendEncodePayloadWithParams(dst, f.Payload, secret, f.Nonce, params)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, HeaderLen+len(enc))
-	out[0] = f.Type
-	binary.BigEndian.PutUint32(out[1:5], f.ConnID)
-	binary.BigEndian.PutUint32(out[5:9], uint32(len(enc)))
-	binary.BigEndian.PutUint32(out[9:13], f.Nonce)
-	copy(out[HeaderLen:], enc)
-	return out, nil
+	binary.BigEndian.PutUint32(dst[start+5:start+9], uint32(len(dst)-payloadStart))
+	return dst, nil
 }
 
 func readFrame(r io.Reader, secret []byte) (Frame, error) {
+	return readFrameWithParams(r, secret, defaultObfsParams())
+}
+
+func readFrameWithParams(r io.Reader, secret []byte, params ObfsParams) (Frame, error) {
 	h := make([]byte, HeaderLen)
 	if _, err := io.ReadFull(r, h); err != nil {
 		return Frame{}, err
@@ -55,7 +69,7 @@ func readFrame(r io.Reader, secret []byte) (Frame, error) {
 		return Frame{}, err
 	}
 	nonce := binary.BigEndian.Uint32(h[9:13])
-	p, err := decodePayload(b, secret, nonce)
+	p, err := decodePayloadWithParams(b, secret, nonce, params)
 	if err != nil {
 		return Frame{}, err
 	}

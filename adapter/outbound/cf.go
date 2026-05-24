@@ -15,26 +15,26 @@ import (
 type CF struct {
 	*Base
 	option   *CFOption
-	client   *cftransport.Client
+	pool     *cftransport.Pool
 	clientMu sync.Mutex
 	cfOpt    cftransport.Option
 }
 
-func (c *CF) getClient() (*cftransport.Client, error) {
+func (c *CF) getClient() (*cftransport.Pool, error) {
 	c.clientMu.Lock()
 	defer c.clientMu.Unlock()
 
-	if c.client != nil {
-		return c.client, nil
+	if c.pool != nil {
+		return c.pool, nil
 	}
 
-	client, err := cftransport.NewClient(c.cfOpt)
+	pool, err := cftransport.NewPool(c.cfOpt)
 	if err != nil {
 		return nil, err
 	}
 
-	c.client = client
-	return c.client, nil
+	c.pool = pool
+	return c.pool, nil
 }
 
 type CFOption struct {
@@ -52,6 +52,18 @@ type CFOption struct {
 	FlushIntervalMs         int    `proxy:"flush_interval_ms,omitempty"`
 	ReadBufSize             int    `proxy:"read_buf_size,omitempty"`
 	FlushBatchBytes         int    `proxy:"flush_batch_bytes,omitempty"`
+	TunnelCount             int    `proxy:"tunnel_count,omitempty"`
+	ObfsNegotiate           bool   `proxy:"obfs_negotiate,omitempty"`
+	ObfsStrictNegotiate     bool   `proxy:"obfs_strict_negotiate,omitempty"`
+	ObfsFallbackMode        string `proxy:"obfs_fallback_mode,omitempty"`
+	ObfsPadMin              int    `proxy:"obfs_pad_min,omitempty"`
+	ObfsPadMax              int    `proxy:"obfs_pad_max,omitempty"`
+	ObfsRotateMin           int    `proxy:"obfs_rotate_min,omitempty"`
+	ObfsRotateMax           int    `proxy:"obfs_rotate_max,omitempty"`
+	ObfsDynamicRotate       bool   `proxy:"obfs_dynamic_rotate,omitempty"`
+	ObfsRotateSpan          int    `proxy:"obfs_rotate_span,omitempty"`
+	ObfsJitterMinMs         int    `proxy:"obfs_jitter_min_ms,omitempty"`
+	ObfsJitterMaxMs         int    `proxy:"obfs_jitter_max_ms,omitempty"`
 }
 
 func (c *CF) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
@@ -94,12 +106,12 @@ func (c *CF) SupportUOT() bool {
 
 func (c *CF) Close() error {
 	c.clientMu.Lock()
-	client := c.client
-	c.client = nil
+	pool := c.pool
+	c.pool = nil
 	c.clientMu.Unlock()
 
-	if client != nil {
-		return client.Close()
+	if pool != nil {
+		return pool.Close()
 	}
 	return nil
 }
@@ -138,6 +150,18 @@ func NewCF(option CFOption) (*CF, error) {
 		FlushInterval:           msOrDefault(option.FlushIntervalMs, 3*time.Millisecond),
 		ReadBufSize:             intOrDefault(option.ReadBufSize, 64*1024),
 		FlushBatch:              intOrDefault(option.FlushBatchBytes, 64*1024),
+		TunnelCount:             intOrDefault(option.TunnelCount, 1),
+		ObfsNegotiate:           option.ObfsNegotiate,
+		ObfsStrictNegotiate:     option.ObfsStrictNegotiate,
+		ObfsFallbackMode:        option.ObfsFallbackMode,
+		ObfsPadMin:              option.ObfsPadMin,
+		ObfsPadMax:              option.ObfsPadMax,
+		ObfsRotateMin:           option.ObfsRotateMin,
+		ObfsRotateMax:           option.ObfsRotateMax,
+		ObfsDynamicRotate:       option.ObfsDynamicRotate,
+		ObfsRotateSpan:          option.ObfsRotateSpan,
+		ObfsJitterMinMs:         option.ObfsJitterMinMs,
+		ObfsJitterMaxMs:         option.ObfsJitterMaxMs,
 	}
 
 	return outbound, nil

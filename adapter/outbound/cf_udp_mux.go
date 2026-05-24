@@ -8,12 +8,10 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	cftransport "github.com/metacubex/mihomo/transport/cf"
 )
 
 type cfMuxPacketConn struct {
-	client *cftransport.Client
+	client cfPacketOpener
 
 	mu            sync.RWMutex
 	conns         map[string]net.PacketConn
@@ -24,6 +22,10 @@ type cfMuxPacketConn struct {
 
 	closed    chan struct{}
 	closeOnce sync.Once
+}
+
+type cfPacketOpener interface {
+	OpenPacket(ctx context.Context, target string) (net.PacketConn, error)
 }
 
 type cfMuxPacket struct {
@@ -56,7 +58,7 @@ func putCFMuxPacketBuf(b []byte) {
 	cfMuxPacketPool.Put(b[:cfMuxPacketBufSize])
 }
 
-func newCFMuxPacketConn(client *cftransport.Client) net.PacketConn {
+func newCFMuxPacketConn(client cfPacketOpener) net.PacketConn {
 	return &cfMuxPacketConn{
 		client: client,
 		conns:  make(map[string]net.PacketConn),
